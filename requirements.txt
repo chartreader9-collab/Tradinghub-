@@ -1,7 +1,0 @@
-streamlit
-pandas
-numpy
-yfinance
-requests
-lxml
-html5lib

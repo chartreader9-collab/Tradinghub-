@@ -105,7 +105,7 @@ if not ua or "@" not in ua:
     st.sidebar.warning("Enter a valid User‑Agent (must include an email).")
 
 lookback_days = st.sidebar.slider("Insider lookback (days)", 30, 365, 180, step=15)
-sec_delay     = st.sidebar.slider("SEC polite delay (sec/request)", 0.12, 0.50, 0.20, step=0.02)
+sec_delay      = st.sidebar.slider("SEC polite delay (sec/request)", 0.12, 0.50, 0.20, step=0.02)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("COT settings")
@@ -297,13 +297,22 @@ def scan_insider_buys(tickers, user_agent, lookback_days, delay) -> pd.DataFrame
 # CSV API: https://publicreporting.cftc.gov/resource/gr4m-cvuh.csv
 
 @st.cache_data(ttl=24*3600, show_spinner=False)
-def fetch_cftc_disagg() -> pd.DataFrame:
+def fetch_cftc_disagg(user_agent: str) -> pd.DataFrame:
+    """
+    Fetches disaggregated COT data from the CFTC's public reporting (Socrata) API.
+    A User-Agent is now required to avoid 403 Forbidden errors.
+    """
     base = "https://publicreporting.cftc.gov/resource/gr4m-cvuh.csv"
     params = {
         "$limit": 500000,
         "$order": "report_date_as_yyyy_mm_dd ASC",
     }
-    r = requests.get(base, params=params, timeout=30)
+    # **FIX**: Add a User-Agent header to the request to prevent 403 errors.
+    headers = {
+        "User-Agent": user_agent,
+        "Accept-Encoding": "gzip, deflate"
+    }
+    r = requests.get(base, params=params, headers=headers, timeout=30)
     r.raise_for_status()
     df = pd.read_csv(io.StringIO(r.text))
     df.columns = [c.strip() for c in df.columns]
@@ -400,28 +409,34 @@ if HAS_STREAMLIT:
         st.subheader("Disaggregated Futures+Options Combined (CFTC Public Reporting)")
         try:
             with st.spinner("Fetching CFTC Public Reporting dataset…"):
-                cftc_df = fetch_cftc_disagg()
+                # **FIX**: Pass the User-Agent to the CFTC fetch function.
+                if not ua or "@" not in ua:
+                    st.error("Enter a valid User-Agent with an email in the sidebar to fetch CFTC data.")
+                    cftc_df = pd.DataFrame() # Create empty df to prevent further errors
+                else:
+                    cftc_df = fetch_cftc_disagg(ua)
 
-            search = st.text_input("Search market", "GOLD")
-            markets = sorted(cftc_df["Market"].dropna().unique())
-            if search:
-                markets = [m for m in markets if search.upper() in m.upper()]
-            if not markets:
-                st.warning("No markets match your search. Try a broader term (e.g., 'GOLD', 'CRUDE', 'CORN').")
-            else:
-                mkt_filter = st.selectbox("Choose/Filter market (substring)", markets, index=0)
-                price_hint = st.text_input("Override price symbol (optional)", value=guess_price_symbol(mkt_filter, price_for_cot))
-                if st.button("Run COT scan", use_container_width=True):
-                    merged = prepare_cot_auto(cftc_df, mkt_filter, price_hint, cot_window_weeks, cot_thresh)
-                    st.dataframe(merged.tail(20), use_container_width=True)
-                    last = merged.iloc[-1]
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("MM Net", f"{int(last['MM_NET']):,}")
-                    c2.metric("COT Index", f"{last['COT_Idx']*100:.1f}%")
-                    c3.metric("Price vs 10W", "Above" if last["PriceUp"] else "Below")
-                    c4.metric("Trigger", "✅" if last["Trigger"] else "—")
-                    st.line_chart(merged.set_index("Date")[ ["MM_NET"] ])
-                    st.line_chart(merged.set_index("Date")[ ["Close","SMA10W"] ])
+            if not cftc_df.empty:
+                search = st.text_input("Search market", "GOLD")
+                markets = sorted(cftc_df["Market"].dropna().unique())
+                if search:
+                    markets = [m for m in markets if search.upper() in m.upper()]
+                if not markets:
+                    st.warning("No markets match your search. Try a broader term (e.g., 'GOLD', 'CRUDE', 'CORN').")
+                else:
+                    mkt_filter = st.selectbox("Choose/Filter market (substring)", markets, index=0)
+                    price_hint = st.text_input("Override price symbol (optional)", value=guess_price_symbol(mkt_filter, price_for_cot))
+                    if st.button("Run COT scan", use_container_width=True):
+                        merged = prepare_cot_auto(cftc_df, mkt_filter, price_hint, cot_window_weeks, cot_thresh)
+                        st.dataframe(merged.tail(20), use_container_width=True)
+                        last = merged.iloc[-1]
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("MM Net", f"{int(last['MM_NET']):,}")
+                        c2.metric("COT Index", f"{last['COT_Idx']*100:.1f}%")
+                        c3.metric("Price vs 10W", "Above" if last["PriceUp"] else "Below")
+                        c4.metric("Trigger", "✅" if last["Trigger"] else "—")
+                        st.line_chart(merged.set_index("Date")[ ["MM_NET"] ])
+                        st.line_chart(merged.set_index("Date")[ ["Close","SMA10W"] ])
         except Exception as e:
             st.error(f"COT error: {e}")
             st.info("If this persists, we can add an alternate fallback or narrower query.")

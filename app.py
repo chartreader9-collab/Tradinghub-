@@ -1,15 +1,9 @@
 # app.py
-# Streamlit Trading Hub: Insider Buys (SEC Form 4) + Prices + COT
-# - Live insider buys via data.sec.gov (parses form4.xml)
-# - Prices via yfinance
-# - COT scanner: upload CFTC/Tradingster CSV OR fetch from a CSV URL
-# Notes:
-#   • Use a real User-Agent (name + email) to avoid SEC rate limiting.
-#   • Keep watchlists modest (e.g., 5–50 tickers) to stay polite with SEC.
+# Trading Hub: Insider Buys (SEC Form 4) + Auto COT (CFTC) + Prices + Market Scan
+# Tip: put SEC_USER_AGENT in Streamlit secrets, or type one in sidebar (name + email).
 
-import time
 import io
-import re
+import time
 import json
 import math
 import requests
@@ -22,47 +16,64 @@ from xml.etree import ElementTree as ET
 
 st.set_page_config(page_title="Trading Hub", page_icon="📊", layout="wide")
 
-# ─────────────────────────────── Settings / Sidebar ───────────────────────────────
+# ───────────────────────── Sidebar / Global Settings ─────────────────────────
 st.sidebar.header("⚙️ Settings")
 
-# SEC requires a real User-Agent; let user type one if secrets not set
 DEFAULT_UA = st.secrets.get("SEC_USER_AGENT", "")
-ua = st.sidebar.text_input("SEC User-Agent (name + email)", value=DEFAULT_UA or "YourName your@email.com")
+ua = st.sidebar.text_input("SEC User-Agent (name + email)", value=DEFAULT_UA or "Your Name you@email.com")
 if not ua or "@" not in ua:
-    st.sidebar.warning("Enter a valid User-Agent (include an email) so SEC allows requests.")
-
-scan_mode = st.sidebar.selectbox("Insider scan mode", ["Single ticker", "Watchlist (comma-separated)"])
-tickers_input = st.sidebar.text_area("Ticker(s) (e.g., AAPL or AAPL,MSFT,NVDA)", value="AAPL")
+    st.sidebar.warning("Enter a valid User-Agent (must include an email).")
 
 lookback_days = st.sidebar.slider("Insider lookback (days)", 30, 365, 180, step=15)
-sec_delay = st.sidebar.slider("SEC polite delay (seconds/request)", 0.12, 0.50, 0.20, step=0.02)
+sec_delay = st.sidebar.slider("SEC polite delay (sec/request)", 0.12, 0.50, 0.20, step=0.02)
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("COT data")
-cot_mode = st.sidebar.radio("COT source", ["Upload CSV", "Fetch from CSV URL"])
-cot_url = st.sidebar.text_input("If 'Fetch from CSV URL', paste URL here", value="")
-price_for_cot = st.sidebar.text_input("Price symbol for 10W SMA (e.g., GC=F, CL=F, ES=F)", value="GC=F")
+st.sidebar.subheader("COT settings")
 cot_window_weeks = st.sidebar.slider("COT Index lookback (weeks)", 52, 260, 156, step=4)
 cot_thresh = st.sidebar.slider("Washed-out threshold (percentile)", 5, 40, 20, step=1)
-time_stop_w = st.sidebar.slider("Time stop (weeks, 0=off)", 0, 26, 12, step=1)
+price_for_cot = st.sidebar.text_input("Default price symbol for COT (e.g., GC=F, CL=F)", value="GC=F")
 
-# ─────────────────────────────── Utilities ───────────────────────────────
+# Helpful mapping for quick price defaults by market name keywords
+PRICE_HINTS = [
+    ("GOLD", "GC=F"),
+    ("CRUDE OIL", "CL=F"),
+    ("WTI", "CL=F"),
+    ("NATURAL GAS", "NG=F"),
+    ("COPPER", "HG=F"),
+    ("SILVER", "SI=F"),
+    ("PLATINUM", "PL=F"),
+    ("PALLADIUM", "PA=F"),
+    ("CORN", "ZC=F"),
+    ("SOYBEANS", "ZS=F"),
+    ("WHEAT", "ZW=F"),
+    ("LIVE CATTLE", "LE=F"),
+    ("LEAN HOGS", "HE=F"),
+    ("S&P", "^GSPC"),
+    ("NASDAQ-100", "^NDX"),
+]
+
+def guess_price_symbol(market_name: str, fallback: str) -> str:
+    up = (market_name or "").upper()
+    for key, sym in PRICE_HINTS:
+        if key in up:
+            return sym
+    return fallback
+
+# ───────────────────────────── SEC / Insider utilities ───────────────────────
 @st.cache_data(show_spinner=False, ttl=24*3600)
 def load_company_tickers_json(user_agent: str) -> pd.DataFrame:
-    # Official mapping file published by SEC (includes cik_str, ticker, title)
     url = "https://www.sec.gov/files/company_tickers.json"
     r = requests.get(url, headers={"User-Agent": user_agent, "Accept-Encoding": "gzip, deflate"})
     r.raise_for_status()
     data = r.json()
-    rows = []
-    for _, v in data.items():
-        rows.append({"cik": str(v["cik_str"]).zfill(10), "ticker": v["ticker"].upper(), "title": v["title"]})
+    rows = [{"cik": str(v["cik_str"]).zfill(10), "ticker": v["ticker"].upper(), "title": v["title"]}
+            for _, v in data.items()]
     return pd.DataFrame(rows)
 
 def to_cik_map(df_map: pd.DataFrame) -> dict:
     return {row["ticker"]: row["cik"] for _, row in df_map.iterrows()}
 
-@st.cache_data(show_spinner=False, ttl=24*3600)
+@st.cache_data(show_spinner=False, ttl=6*3600)
 def get_submissions_json(cik: str, user_agent: str) -> dict:
     url = f"https://data.sec.gov/submissions/CIK{cik}.json"
     r = requests.get(url, headers={"User-Agent": user_agent, "Accept-Encoding": "gzip, deflate"})
@@ -80,46 +91,33 @@ def fetch_form4_xml(cik: str, accession: str, primary_doc: str, user_agent: str)
     return r.text
 
 def parse_form4_buys(xml_text: str) -> list:
-    """
-    Returns a list of dicts for open-market BUY transactions (transactionCode == 'P')
-    from the <nonDerivativeTable>.
-    """
+    """Return list of dicts for open-market BUY transactions (code 'P')."""
     res = []
     try:
         root = ET.fromstring(xml_text)
     except Exception:
         return res
 
-    # Namespaces sometimes present; ignore by matching localname
     def tag_endswith(elem, suffix):
         return elem.tag.lower().endswith(suffix)
 
     for ndt in root.iter():
         if tag_endswith(ndt, "nonderivativetable"):
             for txn in ndt:
-                # Only consider entries with transactionCode 'P'
-                tcode = None
-                shares = None
-                price = None
-                tdate = None
+                tcode = None; shares = None; price = None; tdate = None
                 for ch in txn.iter():
                     if tag_endswith(ch, "transactioncode"):
                         tcode = (ch.text or "").strip()
                     if tag_endswith(ch, "transactionshares"):
-                        # usually inside <value>
                         for vv in ch:
                             if tag_endswith(vv, "value"):
-                                try:
-                                    shares = float(vv.text)
-                                except Exception:
-                                    pass
+                                try: shares = float(vv.text)
+                                except: pass
                     if tag_endswith(ch, "transactionpricepershare"):
                         for vv in ch:
                             if tag_endswith(vv, "value"):
-                                try:
-                                    price = float(vv.text)
-                                except Exception:
-                                    pass
+                                try: price = float(vv.text)
+                                except: pass
                     if tag_endswith(ch, "transactiondate"):
                         for vv in ch:
                             if tag_endswith(vv, "value"):
@@ -129,12 +127,9 @@ def parse_form4_buys(xml_text: str) -> list:
     return res
 
 def polite_sleep(s: float):
-    try:
-        time.sleep(s)
-    except Exception:
-        pass
+    try: time.sleep(s)
+    except: pass
 
-# ─────────────────────────────── Insider Buys Scanner ───────────────────────────────
 def scan_insider_buys(tickers: list, user_agent: str, lookback_days: int, delay: float) -> pd.DataFrame:
     m = load_company_tickers_json(user_agent)
     cm = to_cik_map(m)
@@ -148,7 +143,6 @@ def scan_insider_buys(tickers: list, user_agent: str, lookback_days: int, delay:
                              "LatestBuyDate": None, "Note": "Ticker not in SEC map"})
             continue
 
-        # Pull submissions index to list recent 4/4A filings
         try:
             sub = get_submissions_json(cik, user_agent)
         except Exception as e:
@@ -162,192 +156,281 @@ def scan_insider_buys(tickers: list, user_agent: str, lookback_days: int, delay:
         pdoc_list = forms.get("primaryDocument", [])
         fdate_list = forms.get("filingDate", [])
 
-        total_usd = 0.0
-        buys = 0
-        last_date = None
+        total_usd = 0.0; buys = 0; last_date = None
 
-        # Iterate newest → oldest
         for form, acc, pdoc, fdate in zip(form_list, acc_list, pdoc_list, fdate_list):
-            if form not in ("4", "4/A"):
-                continue
-            try:
-                filed = datetime.strptime(fdate, "%Y-%m-%d").date()
-            except Exception:
-                filed = None
-            if filed and filed < cutoff:
-                # older than lookback window; skip remaining
-                continue
+            if form not in ("4", "4/A"): continue
+            try: filed = datetime.strptime(fdate, "%Y-%m-%d").date()
+            except: filed = None
+            if filed and filed < cutoff: continue
+
             try:
                 xml_text = fetch_form4_xml(cik, acc, pdoc, user_agent)
-                txns = parse_form4_buys(xml_text)
-                for t in txns:
-                    # Use transaction date for latest flag
-                    try:
-                        t_d = datetime.strptime(t.get("date",""), "%Y-%m-%d").date()
-                    except Exception:
-                        t_d = filed
+                for t in parse_form4_buys(xml_text):
+                    try: t_d = datetime.strptime(t.get("date",""), "%Y-%m-%d").date()
+                    except: t_d = filed
                     if t_d and t_d >= cutoff:
-                        total_usd += float(t["value"])
-                        buys += 1
-                        if (not last_date) or (t_d > last_date):
-                            last_date = t_d
+                        total_usd += float(t["value"]); buys += 1
+                        if (not last_date) or (t_d > last_date): last_date = t_d
                 polite_sleep(delay)
             except Exception:
-                polite_sleep(delay)
-                continue
+                polite_sleep(delay); continue
 
         out_rows.append({"Ticker": tk, "CIK": cik, "BuyUSD_lookback": total_usd, "Buys": buys,
-                         "LatestBuyDate": last_date.isoformat() if last_date else None,
-                         "Note": ""})
+                         "LatestBuyDate": last_date.isoformat() if last_date else None, "Note": ""})
 
-    df = pd.DataFrame(out_rows).sort_values("BuyUSD_lookback", ascending=False).reset_index(drop=True)
-    return df
+    return pd.DataFrame(out_rows).sort_values("BuyUSD_lookback", ascending=False).reset_index(drop=True)
 
-# ─────────────────────────────── Price helpers ───────────────────────────────
+# ───────────────────────────── Prices / yfinance ─────────────────────────────
 @st.cache_data(show_spinner=False, ttl=6*3600)
-def yf_prices(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
+def yf_prices(symbol: str, period: str="1y", interval: str="1d") -> pd.DataFrame:
     df = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False)
     df = df.reset_index()
     if "Date" not in df.columns:
-        # yfinance sometimes names the index differently
         df.rename(columns={df.columns[0]:"Date"}, inplace=True)
     return df
 
 def weekly_from_daily(df: pd.DataFrame) -> pd.DataFrame:
-    w = df.set_index("Date").resample("W-FRI").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna()
+    w = df.set_index("Date").resample("W-FRI").agg(
+        {"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna()
     return w.reset_index()
 
-# ─────────────────────────────── COT Scanner ───────────────────────────────
+# ───────────────────────────── COT (auto from CFTC) ──────────────────────────
+# We try a couple of official endpoints (CSV/TXT). The Disaggregated Futures+Options Combined dataset is ideal.
+CFTC_ENDPOINTS = [
+    "https://www.cftc.gov/dea/newcot/DisaggComFutOpt.csv",  # primary
+    "https://www.cftc.gov/dea/newcot/DisaggComFut.csv",     # futures-only fallback
+    "https://www.cftc.gov/dea/newcot/DisaggComFutOpt.txt",  # sometimes served as txt
+]
+
+COT_COL_SYNONYMS = {
+    "date": ["Report_Date_as_YYYY-MM-DD", "Report_Date", "Report_Date_as_YYYY_MM_DD"],
+    "market": ["Market_and_Exchange_Names", "Market_and_Exchange_Name"],
+    "code": ["CFTC_Contract_Market_Code", "CFTC_Contract_Market_Code_"],
+    "mm_long": ["Mgr_Positions_Long_All", "Money_Manager_Long_All", "Money_Manager_Long_All_Positions"],
+    "mm_short": ["Mgr_Positions_Short_All", "Money_Manager_Short_All", "Money_Manager_Short_All_Positions"],
+    "oi": ["Open_Interest_All", "Open_Interest_All_All"],
+}
+
+def pick_col(cols, keys):
+    lc = {c.lower(): c for c in cols}
+    for k in keys:
+        if k.lower() in lc:
+            return lc[k.lower()]
+    # fuzzy match
+    for k in keys:
+        for c in cols:
+            if c.lower().startswith(k.lower()):
+                return c
+    return None
+
+@st.cache_data(show_spinner=False, ttl=24*3600)
+def fetch_cftc_disagg() -> pd.DataFrame:
+    last_err = None
+    for url in CFTC_ENDPOINTS:
+        try:
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+            try:
+                df = pd.read_csv(io.StringIO(r.text))
+            except Exception:
+                df = pd.read_csv(io.StringIO(r.text), sep=";")
+            # Normalize columns (strip spaces)
+            df.rename(columns=lambda x: str(x).strip().replace(" ", "_"), inplace=True)
+            # Try to coerce date
+            date_col = pick_col(df.columns, COT_COL_SYNONYMS["date"])
+            if date_col:
+                df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+            return df
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"CFTC fetch failed. Last error: {last_err}")
+
+def standardize_cot(df: pd.DataFrame) -> pd.DataFrame:
+    date_col   = pick_col(df.columns, COT_COL_SYNONYMS["date"])
+    mkt_col    = pick_col(df.columns, COT_COL_SYNONYMS["market"])
+    code_col   = pick_col(df.columns, COT_COL_SYNONYMS["code"])
+    mm_long_c  = pick_col(df.columns, COT_COL_SYNONYMS["mm_long"])
+    mm_short_c = pick_col(df.columns, COT_COL_SYNONYMS["mm_short"])
+    oi_c       = pick_col(df.columns, COT_COL_SYNONYMS["oi"])
+
+    needed = [date_col, mkt_col, code_col, mm_long_c, mm_short_c]
+    if any(c is None for c in needed):
+        raise ValueError("COT: could not detect required columns from CFTC file.")
+
+    out = df[[date_col, mkt_col, code_col, mm_long_c, mm_short_c]].copy()
+    out.columns = ["Report_Date", "Market", "Market_Code", "MM_LONG", "MM_SHORT"]
+    out["Report_Date"] = pd.to_datetime(out["Report_Date"], errors="coerce")
+    out = out.dropna(subset=["Report_Date"])
+    out["MM_NET"] = pd.to_numeric(out["MM_LONG"], errors="coerce") - pd.to_numeric(out["MM_SHORT"], errors="coerce")
+    if oi_c and oi_c in df.columns:
+        out["Open_Interest"] = pd.to_numeric(df[oi_c], errors="coerce")
+    else:
+        out["Open_Interest"] = np.nan
+    out = out.sort_values(["Market", "Report_Date"]).reset_index(drop=True)
+    return out
+
 def cot_index(series: pd.Series, window: int) -> pd.Series:
-    lo = series.rolling(window).min()
-    hi = series.rolling(window).max()
+    lo = series.rolling(window, min_periods=4).min()
+    hi = series.rolling(window, min_periods=4).max()
     return (series - lo) / (hi - lo + 1e-12)
 
-def load_cot_from_csv_file(file: io.BytesIO) -> pd.DataFrame:
-    df = pd.read_csv(file, parse_dates=["Date"])
-    return df
+def compute_cot_signals(df_std: pd.DataFrame, mkt: str, price_symbol_hint: str, window: int, pctl: float):
+    mdf = df_std[df_std["Market"] == mkt].copy()
+    if mdf.empty:
+        return None, None
+    mdf["COT_Idx"] = cot_index(mdf["MM_NET"], window)
+    mdf["Washed"]  = (mdf["MM_NET"] < 0) | (mdf["COT_Idx"] <= (pctl/100.0))
+    mdf["TurnUp"]  = mdf["MM_NET"].diff() > 0
 
-def load_cot_from_url(url: str) -> pd.DataFrame:
-    r = requests.get(url, headers={"User-Agent": ua, "Accept-Encoding": "gzip, deflate"})
-    r.raise_for_status()
-    buf = io.BytesIO(r.content)
-    return pd.read_csv(buf, parse_dates=["Date"])
-
-def prepare_cot(df: pd.DataFrame, price_symbol: str, window: int) -> pd.DataFrame:
-    """
-    Expects a CSV with columns at least:
-      Date, Managed Money Longs, Managed Money Shorts   (or 'MM_LONG','MM_SHORT')
-    """
-    cols = {c.lower(): c for c in df.columns}
-    # flexible column detection
-    def pick(*names):
-        for n in names:
-            if n.lower() in cols: return cols[n.lower()]
-        return None
-
-    c_long = pick("Managed Money Longs", "MM_LONG", "managed_money_longs")
-    c_short= pick("Managed Money Shorts","MM_SHORT","managed_money_shorts")
-
-    if not c_long or not c_short or "Date" not in df.columns:
-        raise ValueError("COT CSV must include Date, Managed Money Longs, Managed Money Shorts columns")
-
-    cotw = (df[["Date", c_long, c_short]]
-            .rename(columns={c_long:"MM_LONG", c_short:"MM_SHORT"})
-            .sort_values("Date").reset_index(drop=True))
-    cotw["MM_NET"] = cotw["MM_LONG"] - cotw["MM_SHORT"]
-
-    # weekly price + 10W SMA
-    px = yf_prices(price_symbol, period="5y", interval="1d")
+    # price series for 10W SMA
+    px_symbol = guess_price_symbol(mkt, price_symbol_hint or price_for_cot)
+    px = yf_prices(px_symbol, period="5y", interval="1d")
     wpx = weekly_from_daily(px)
     wpx["SMA10W"] = wpx["Close"].rolling(10).mean()
 
-    merged = pd.merge_asof(wpx.sort_values("Date"), cotw.sort_values("Date"), on="Date", direction="backward")
-    merged["COT_Idx"] = cot_index(merged["MM_NET"], window)  # 0..1
-    merged["Washed"]  = (merged["MM_NET"] < 0) | (merged["COT_Idx"] <= (cot_thresh/100.0))
-    merged["TurnUp"]  = merged["MM_NET"].diff() > 0
+    merged = pd.merge_asof(
+        wpx.sort_values("Date"), mdf.sort_values("Report_Date"),
+        left_on="Date", right_on="Report_Date", direction="backward"
+    )
     merged["PriceUp"] = merged["Close"] > merged["SMA10W"]
     merged["Trigger"] = merged["Washed"] & merged["TurnUp"] & merged["PriceUp"]
-    return merged
 
-# ─────────────────────────────── UI / Tabs ───────────────────────────────
+    latest = merged.iloc[-1] if len(merged) else None
+    return merged, latest
+
+# ───────────────────────────── Market (S&P 500) list ─────────────────────────
+@st.cache_data(show_spinner=False, ttl=24*3600)
+def load_sp500_tickers() -> list:
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    tables = pd.read_html(url)
+    df = tables[0]
+    return [str(t).upper().strip().replace(".", "-") for t in df["Symbol"].tolist()]
+
+def batch(lst, size):
+    for i in range(0, len(lst), size):
+        yield lst[i:i+size]
+
+# ───────────────────────────────────── UI ─────────────────────────────────────
 st.title("📊 Trading Hub — Real Data")
 
-tab1, tab2, tab3 = st.tabs(["🏦 Insider Buys (SEC Form 4)", "📝 COT Scanner", "📈 Prices & SMA"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "🏦 Insider (watchlist)",
+    "📝 COT (auto from CFTC)",
+    "📈 Prices",
+    "🌐 Market Scan (S&P 500)"
+])
 
-# ── Tab 1: Insider Buys ────────────────────────────────────────────────────
+# ------------------------------ Tab 1: Insider -------------------------------
 with tab1:
-    st.subheader("Largest insider buys over your lookback window")
-    if scan_mode == "Single ticker":
-        tickers = [tickers_input.strip()]
-    else:
-        tickers = [t.strip() for t in tickers_input.split(",") if t.strip()]
-
+    st.subheader("Insider Buys from SEC Form 4 (open-market 'P')")
+    tickers_input = st.text_input("Enter comma-separated tickers", "AAPL,MSFT,NVDA")
     if st.button("Scan insiders", use_container_width=True):
         if not ua or "@" not in ua:
-            st.error("Please enter a valid User-Agent with an email in the sidebar.")
+            st.error("Please enter a valid User-Agent (with email) in the sidebar.")
         else:
+            tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
             with st.spinner("Contacting SEC…"):
                 df = scan_insider_buys(tickers, ua, lookback_days, sec_delay)
             st.success("Done.")
             st.dataframe(df, use_container_width=True)
-            top = df.iloc[0] if len(df)>0 else None
-            if top is not None:
+            if len(df):
+                top = df.iloc[0]
                 st.caption(f"Top: {top['Ticker']} — ${top['BuyUSD_lookback']:,.0f} over last {lookback_days} days; buys: {int(top['Buys'])}")
 
-    st.markdown("""
-**Tips**
-- Keep lists reasonable (e.g., 5–50 tickers) to respect SEC’s request limits.
-- Only **open-market buys** (transactionCode `P`) are counted. Grants/awards are ignored.
-- You can re-run anytime; results are cached briefly for speed.
-""")
-
-# ── Tab 2: COT Scanner ─────────────────────────────────────────────────────
+# ------------------------------ Tab 2: COT ----------------------------------
 with tab2:
-    st.subheader("Weekly COT extremes + turn + price filter")
-    uploaded = None
-    if cot_mode == "Upload CSV":
-        uploaded = st.file_uploader("Upload COT CSV (must include Date, Managed Money Longs, Managed Money Shorts)", type=["csv"])
-    else:
-        if st.button("Fetch COT CSV from URL"):
-            pass
-
-    df_cot = None
+    st.subheader("Weekly COT — Auto fetch from CFTC (Disaggregated, Futures+Options Combined)")
     try:
-        if cot_mode == "Upload CSV" and uploaded is not None:
-            df_cot = load_cot_from_csv_file(uploaded)
-        elif cot_mode == "Fetch from CSV URL" and cot_url.strip():
-            df_cot = load_cot_from_url(cot_url.strip())
-        if df_cot is not None:
-            merged = prepare_cot(df_cot, price_for_cot, cot_window_weeks)
+        with st.spinner("Fetching CFTC Disaggregated data…"):
+            raw = fetch_cftc_disagg()
+        df_std = standardize_cot(raw)
+
+        # Market selector with search
+        search = st.text_input("Search market", "GOLD")
+        markets = sorted(df_std["Market"].unique())
+        if search:
+            markets = [m for m in markets if search.upper() in m.upper()]
+        mkt = st.selectbox("Choose market", markets)
+
+        price_hint = st.text_input("Override price symbol (optional)", value=guess_price_symbol(mkt, price_for_cot))
+        merged, latest = compute_cot_signals(df_std, mkt, price_hint, cot_window_weeks, cot_thresh)
+
+        if merged is not None:
             st.dataframe(merged.tail(20), use_container_width=True)
+            c1,c2,c3,c4 = st.columns(4)
             last = merged.iloc[-1]
-            colA, colB, colC, colD = st.columns(4)
-            colA.metric("MM Net", f"{int(last['MM_NET']):,}")
-            colB.metric("COT Index", f"{last['COT_Idx']*100:.1f}%")
-            colC.metric("Price vs 10W", "Above" if last["PriceUp"] else "Below")
-            colD.metric("Trigger", "✅" if last["Trigger"] else "—")
+            c1.metric("MM Net", f"{int(last['MM_NET']):,}")
+            c2.metric("COT Index", f"{(last['COT_Idx']*100):.1f}%")
+            c3.metric("Price vs 10W", "Above" if last["PriceUp"] else "Below")
+            c4.metric("Trigger", "✅" if last["Trigger"] else "—")
             st.line_chart(merged.set_index("Date")[["MM_NET"]])
             st.line_chart(merged.set_index("Date")[["Close","SMA10W"]])
-            st.caption("Trigger rule: Washed-out (COT index <= threshold or net<0) AND turning up WoW AND price > 10W SMA.")
         else:
-            st.info("Upload a COT CSV or paste a CSV URL, then the app will compute signals.")
+            st.warning("No rows for that market.")
     except Exception as e:
-        st.error(f"COT error: {e}")
+        st.error(f"COT auto-fetch error: {e}")
+        st.info("If issues persist, you can temporarily use the older upload approach we had earlier.")
 
-# ── Tab 3: Prices ──────────────────────────────────────────────────────────
+# ------------------------------ Tab 3: Prices -------------------------------
 with tab3:
     st.subheader("Quick price chart with SMA")
     px_ticker = st.text_input("Ticker (e.g., AAPL, GC=F, CL=F)", value="AAPL", key="px_ticker")
     period = st.selectbox("Period", ["6mo","1y","2y","5y"], index=1)
     if st.button("Load prices", key="load_px"):
         dfp = yf_prices(px_ticker, period=period, interval="1d")
-        if len(dfp) == 0:
-            st.error("No data returned for that ticker.")
+
+        # Robust Date / Close normalization
+        if "Date" not in dfp.columns:
+            dfp.reset_index(inplace=True)
+            for cand in ("index","Datetime","datetime","date"):
+                if cand in dfp.columns:
+                    dfp.rename(columns={cand:"Date"}, inplace=True)
+                    break
+        if "Close" not in dfp.columns and "close" in dfp.columns:
+            dfp.rename(columns={"close":"Close"}, inplace=True)
+
+        if "Date" not in dfp.columns:
+            st.error("No Date column found in price data.")
+        elif "Close" not in dfp.columns:
+            st.error("No Close price found in price data.")
         else:
-            dfp["SMA50"] = dfp["Close"].rolling(50).mean()
+            dfp["SMA50"]  = dfp["Close"].rolling(50).mean()
             dfp["SMA200"] = dfp["Close"].rolling(200).mean()
-            st.line_chart(dfp.set_index("Date")[["Close","SMA50","SMA200"]])
+            st.line_chart(dfp.set_index("Date")[["Close","SMA50","SMA200"]], use_container_width=True)
             st.dataframe(dfp.tail(20), use_container_width=True)
 
+# --------------------------- Tab 4: Market Scan -----------------------------
+with tab4:
+    st.subheader("S&P 500 Insider Buy Leaderboard (batch-scanned)")
+    st.caption("Loads S&P 500 from Wikipedia, scans in batches to respect SEC rate limits.")
+    colA, colB = st.columns(2)
+    batch_size = colA.slider("Batch size (tickers per batch)", 20, 200, 60, step=10)
+    max_batches = colB.slider("How many batches to run now", 1, 20, 3, step=1)
+    if st.button("Run S&P 500 Scan", use_container_width=True):
+        if not ua or "@" not in ua:
+            st.error("Please enter a valid User-Agent (with email) in the sidebar.")
+        else:
+            with st.spinner("Fetching S&P 500 list…"):
+                sp = load_sp500_tickers()
+
+            totals = []
+            batches_run = 0
+            for group in (g for g in (list(batch(sp, batch_size))[:max_batches])):
+                df = scan_insider_buys(group, ua, lookback_days, sec_delay)
+                totals.append(df)
+                batches_run += 1
+                st.write(f"Completed batch {batches_run}: scanned {len(group)} tickers")
+
+            if totals:
+                big = pd.concat(totals, ignore_index=True).sort_values("BuyUSD_lookback", ascending=False)
+                st.success("Done.")
+                st.dataframe(big.head(20), use_container_width=True)
+                st.caption(f"Scanned {min(batch_size*max_batches, len(sp))} of {len(sp)} tickers "
+                           f"({batches_run} batches). Increase 'max batches' and run again to cover more.")
+            else:
+                st.warning("No results (check connection or lower rate limits).")
+
 st.markdown("---")
-st.caption("Be nice to the SEC: keep requests <=10/sec, use a valid User-Agent, and avoid scanning the whole market at once.")
+st.caption("Be polite to the SEC: ≤10 req/sec, real User-Agent. CFTC data is fetched directly; triggers: washed-out & turn up & price > 10W.")

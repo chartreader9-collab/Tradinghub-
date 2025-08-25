@@ -1,6 +1,6 @@
 # app.py
-# Trading Hub: Insider Buys (SEC Form 4) + Auto COT (CFTC) + Prices + S&P500 Scan
-# Put SEC_USER_AGENT in Secrets or enter in the sidebar (name + email).
+# Trading Hub: Insider Buys (SEC Form 4) + Auto COT (CFTC Socrata) + Prices + S&P500 Scan
+# Tip: Add a Streamlit secret:  SEC_USER_AGENT = Your Name <you@example.com>
 
 import io, time, requests, pandas as pd, numpy as np, streamlit as st, yfinance as yf
 from datetime import datetime, timedelta
@@ -155,54 +155,52 @@ def scan_insider_buys(tickers, user_agent, lookback_days, delay):
                     "LatestBuyDate": last_date.isoformat() if last_date else None, "Note": ""})
     return pd.DataFrame(out).sort_values("BuyUSD_lookback", ascending=False).reset_index(drop=True)
 
-# ───────── COT (auto from CFTC) ─────────
-CFTC_ENDPOINTS = [
-    "https://www.cftc.gov/dea/newcot/DisaggComFutOpt.csv",
-    "https://www.cftc.gov/dea/newcot/DisaggComFut.csv",
-    "https://www.cftc.gov/dea/newcot/DisaggComFutOpt.txt",
-]
-COT_COLS = {
-    "date": ["Report_Date_as_YYYY-MM-DD","Report_Date","Report_Date_as_YYYY_MM_DD"],
-    "market": ["Market_and_Exchange_Names","Market_and_Exchange_Name"],
-    "mm_long": ["Mgr_Positions_Long_All","Money_Manager_Long_All","Money_Manager_Long_All_Positions"],
-    "mm_short":["Mgr_Positions_Short_All","Money_Manager_Short_All","Money_Manager_Short_All_Positions"]
-}
-
-def pick_col(cols, names):
-    lc = {c.lower(): c for c in cols}
-    for n in names:
-        if n.lower() in lc: return lc[n.lower()]
-    for n in names:
-        for c in cols:
-            if c.lower().startswith(n.lower()): return c
-    return None
-
+# ───────── COT (auto via CFTC Public Reporting / Socrata) ─────────
+# Dataset: Disaggregated - Futures & Options Combined
+# CSV API: https://publicreporting.cftc.gov/resource/gr4m-cvuh.csv
 @st.cache_data(ttl=24*3600, show_spinner=False)
-def fetch_cftc_disagg():
-    last_err=None
-    for url in CFTC_ENDPOINTS:
-        try:
-            r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=30)
-            r.raise_for_status()
-            try: df = pd.read_csv(io.StringIO(r.text))
-            except Exception: df = pd.read_csv(io.StringIO(r.text), sep=";")
-            df.rename(columns=lambda x: str(x).strip().replace(" ","_"), inplace=True)
-            dcol = pick_col(df.columns, COT_COLS["date"]);  mcol = pick_col(df.columns, COT_COLS["market"])
-            lcol = pick_col(df.columns, COT_COLS["mm_long"]); scol = pick_col(df.columns, COT_COLS["mm_short"])
-            if not all([dcol,mcol,lcol,scol]): continue
-            df = df[[dcol,mcol,lcol,scol]].rename(columns={dcol:"Date", mcol:"Market", lcol:"MM_LONG", scol:"MM_SHORT"})
-            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-            df = df.dropna(subset=["Date"]).sort_values("Date")
-            return df
-        except Exception as e:
-            last_err=e; continue
-    raise RuntimeError(f"CFTC fetch failed. Last error: {last_err}")
+def fetch_cftc_disagg() -> pd.DataFrame:
+    base = "https://publicreporting.cftc.gov/resource/gr4m-cvuh.csv"
+    params = {
+        "$limit": 500000,                        # large page to cover many years
+        "$order": "report_date_as_yyyy_mm_dd ASC"
+    }
+    r = requests.get(base, params=params, timeout=30)
+    r.raise_for_status()
+    df = pd.read_csv(io.StringIO(r.text))
+    df.columns = [c.strip() for c in df.columns]
+
+    lc = {c.lower(): c for c in df.columns}
+    def need(name):
+        if name not in lc:
+            raise RuntimeError(f"CFTC columns changed or unavailable: missing {name}")
+        return lc[name]
+
+    date_c  = need("report_date_as_yyyy_mm_dd")
+    mkt_c   = need("market_and_exchange_names")
+    long_c  = need("mgr_positions_long_all")
+    short_c = need("mgr_positions_short_all")
+
+    out = df[[date_c, mkt_c, long_c, short_c]].copy()
+    out.rename(columns={
+        date_c: "Date",
+        mkt_c:  "Market",
+        long_c: "MM_LONG",
+        short_c:"MM_SHORT",
+    }, inplace=True)
+
+    out["Date"]    = pd.to_datetime(out["Date"], errors="coerce")
+    out["MM_LONG"] = pd.to_numeric(out["MM_LONG"], errors="coerce")
+    out["MM_SHORT"]= pd.to_numeric(out["MM_SHORT"], errors="coerce")
+    out = out.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+    return out
 
 def prepare_cot_auto(cftc_df: pd.DataFrame, market_filter: str, price_symbol: str, window: int, pctl: float):
     sub = cftc_df[cftc_df["Market"].str.contains(market_filter, case=False, na=False)].copy()
     if sub.empty: raise ValueError("No rows found for that market filter.")
     sub = sub[["Date","Market","MM_LONG","MM_SHORT"]].sort_values("Date").reset_index(drop=True)
-    sub["MM_NET"] = pd.to_numeric(sub["MM_LONG"], errors="coerce") - pd.to_numeric(sub["MM_SHORT"], errors="coerce")
+    sub["MM_NET"] = sub["MM_LONG"] - sub["MM_SHORT"]
+
     px = yf_prices(price_symbol, period="10y", interval="1d")
     wpx = weekly_from_daily(px); wpx["SMA10W"] = wpx["Close"].rolling(10).mean()
     merged = pd.merge_asof(wpx.sort_values("Date"), sub.sort_values("Date"), on="Date", direction="backward")
@@ -249,31 +247,35 @@ with tab1:
                 top = df.iloc[0]
                 st.caption(f"Top: {top['Ticker']} — ${top['BuyUSD_lookback']:,.0f} in {lookback_days}d; buys: {int(top['Buys'])}")
 
-# Tab 2 — COT auto
+# Tab 2 — COT auto (Socrata)
 with tab2:
-    st.subheader("Disaggregated Futures+Options Combined (CFTC)")
+    st.subheader("Disaggregated Futures+Options Combined (CFTC Public Reporting)")
     try:
-        with st.spinner("Fetching CFTC disaggregated file…"):
+        with st.spinner("Fetching CFTC Public Reporting dataset…"):
             cftc_df = fetch_cftc_disagg()
+
         search = st.text_input("Search market", "GOLD")
         markets = sorted(cftc_df["Market"].dropna().unique())
         if search: markets = [m for m in markets if search.upper() in m.upper()]
-        mkt_filter = st.selectbox("Choose/Filter market (substring)", markets, index=0) if markets else st.text_input("Market filter")
-        price_hint = st.text_input("Override price symbol (optional)", value=guess_price_symbol(mkt_filter, price_for_cot))
-        if st.button("Run COT scan", use_container_width=True):
-            merged = prepare_cot_auto(cftc_df, mkt_filter, price_hint, cot_window_weeks, cot_thresh)
-            st.dataframe(merged.tail(20), use_container_width=True)
-            last = merged.iloc[-1]
-            c1,c2,c3,c4 = st.columns(4)
-            c1.metric("MM Net", f"{int(last['MM_NET']):,}")
-            c2.metric("COT Index", f"{last['COT_Idx']*100:.1f}%")
-            c3.metric("Price vs 10W", "Above" if last["PriceUp"] else "Below")
-            c4.metric("Trigger", "✅" if last["Trigger"] else "—")
-            st.line_chart(merged.set_index("Date")[["MM_NET"]])
-            st.line_chart(merged.set_index("Date")[["Close","SMA10W"]])
+        if not markets:
+            st.warning("No markets match your search. Try a broader term (e.g., 'GOLD', 'CRUDE', 'CORN').")
+        else:
+            mkt_filter = st.selectbox("Choose/Filter market (substring)", markets, index=0)
+            price_hint = st.text_input("Override price symbol (optional)", value=guess_price_symbol(mkt_filter, price_for_cot))
+            if st.button("Run COT scan", use_container_width=True):
+                merged = prepare_cot_auto(cftc_df, mkt_filter, price_hint, cot_window_weeks, cot_thresh)
+                st.dataframe(merged.tail(20), use_container_width=True)
+                last = merged.iloc[-1]
+                c1,c2,c3,c4 = st.columns(4)
+                c1.metric("MM Net", f"{int(last['MM_NET']):,}")
+                c2.metric("COT Index", f"{last['COT_Idx']*100:.1f}%")
+                c3.metric("Price vs 10W", "Above" if last["PriceUp"] else "Below")
+                c4.metric("Trigger", "✅" if last["Trigger"] else "—")
+                st.line_chart(merged.set_index("Date")[["MM_NET"]])
+                st.line_chart(merged.set_index("Date")[["Close","SMA10W"]])
     except Exception as e:
         st.error(f"COT error: {e}")
-        st.info("If CFTC shifts files, try again later or we can add more fallbacks.")
+        st.info("If this persists, we can add an alternate fallback or narrower query.")
 
 # Tab 3 — Prices
 with tab3:
@@ -311,7 +313,7 @@ with tab4:
             with st.spinner("Loading S&P 500 list…"):
                 sp = load_sp500_tickers()
             results=[]; batches=0
-            for grp in batch(sp, batch_size):
+            for grp in (sp[i:i+batch_size] for i in range(0, len(sp), batch_size)):
                 if batches >= max_batches: break
                 df = scan_insider_buys(grp, ua, lookback_days, sec_delay)
                 results.append(df); batches += 1

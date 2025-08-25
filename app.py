@@ -284,7 +284,7 @@ def fetch_cftc_disagg(user_agent: str) -> pd.DataFrame:
         "Connection": "keep-alive",
     }
 
-    # **FIX**: Add a retry mechanism to handle transient HTTP errors from the server.
+    # **FIX**: Add robust error handling. If all retries fail, return an empty DataFrame.
     for i in range(3): # Try up to 3 times
         try:
             r = requests.get(base, params=params, headers=headers, timeout=30)
@@ -301,13 +301,15 @@ def fetch_cftc_disagg(user_agent: str) -> pd.DataFrame:
             out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
             for col in ["MM_LONG", "MM_SHORT"]: out[col] = pd.to_numeric(out[col], errors="coerce")
             return out.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
-        except requests.exceptions.HTTPError as e:
+        except requests.exceptions.RequestException as e:
+            # If we get an error, wait and try again.
             if i < 2: # If not the last attempt
-                time.sleep(3) # Wait for 3 seconds before retrying
+                time.sleep(i * 2 + 3) # Exponential backoff: 3s, 5s
                 continue
             else:
-                raise e # Re-raise the exception if all retries fail
-
+                # All retries failed, log the error and return empty.
+                print(f"CFTC fetch failed after multiple retries: {e}", file=sys.stderr)
+                return pd.DataFrame() # Return empty DataFrame on final failure
 
 def prepare_cot_auto(cftc_df: pd.DataFrame, market_filter: str, price_symbol: str, window: int, pctl: float) -> pd.DataFrame:
     sub = cftc_df[cftc_df["Market"].str.contains(market_filter, case=False, na=False)].copy()
@@ -408,25 +410,32 @@ if HAS_STREAMLIT:
                     st.caption(f"Top: {top['Ticker']} — ${top['BuyUSD_lookback']:,.0f} in {lookback_days}d; buys: {int(top['Buys'])}")
 
     # Common COT data loading
-    cftc_df = None
     if 'cftc_df' not in st.session_state:
         st.session_state.cftc_df = None
 
     def load_cftc_data():
+        # Use a button to prevent re-fetching on every script rerun
         if st.session_state.cftc_df is None:
-            if not ua or "@" not in ua:
-                st.error("Enter a valid User-Agent in the sidebar to fetch CFTC data.")
-                return None
-            with st.spinner("Fetching CFTC Public Reporting dataset…"):
-                st.session_state.cftc_df = fetch_cftc_disagg(ua)
+            st.info("CFTC data not loaded.")
+            if st.button("Load CFTC Data", key="load_cftc"):
+                if not ua or "@" not in ua:
+                    st.error("Enter a valid User-Agent in the sidebar to fetch CFTC data.")
+                    return None
+                with st.spinner("Fetching CFTC Public Reporting dataset…"):
+                    st.session_state.cftc_df = fetch_cftc_disagg(ua)
+                    # After fetching, rerun the script to update the UI
+                    st.rerun()
         return st.session_state.cftc_df
 
     # Tab 2 — COT auto (Socrata)
     with tab2:
         st.subheader("Disaggregated Futures+Options Combined (CFTC Public Reporting)")
-        try:
-            cftc_df = load_cftc_data()
-            if cftc_df is not None and not cftc_df.empty:
+        cftc_df = load_cftc_data()
+        if cftc_df is not None:
+            if cftc_df.empty:
+                st.error("Failed to load CFTC data after multiple retries. The server may be down. Please try again later.")
+            else:
+                st.success("CFTC data loaded successfully.")
                 search = st.text_input("Search market", "GOLD", key="cot_search")
                 markets = sorted(cftc_df["Market"].dropna().unique())
                 if search: markets = [m for m in markets if search.upper() in m.upper()]
@@ -445,54 +454,57 @@ if HAS_STREAMLIT:
                         c4.metric("Trigger", "✅" if last["Trigger"] else "—")
                         st.line_chart(merged.set_index("Date")[["MM_NET"]])
                         st.line_chart(merged.set_index("Date")[["Close", "SMA10W"]])
-        except Exception as e:
-            st.error(f"COT error: {e}")
 
     # Tab 3 - COT Washout Strategy
     with tab3:
         st.subheader("COT Washout Strategy Scanner")
         st.markdown("Scans all markets for extreme bearish sentiment combined with early signs of price strength.")
-        if st.button("Scan All Markets for Washouts", use_container_width=True, key="washout_scan"):
-            cftc_df = load_cftc_data()
-            if cftc_df is not None and not cftc_df.empty:
-                results = []
-                markets = cftc_df['Market'].unique()
-                progress_bar = st.progress(0, text="Scanning markets...")
-                for i, market in enumerate(markets):
-                    market_df = cftc_df[cftc_df['Market'] == market].copy()
-                    if len(market_df) < cot_window_weeks: continue
-                    market_df['MM_NET'] = market_df['MM_LONG'] - market_df['MM_SHORT']
-                    market_df['COT_Idx'] = cot_index(market_df['MM_NET'], cot_window_weeks)
-                    latest, previous = market_df.iloc[-1], market_df.iloc[-2]
-                    is_washed = (latest['MM_NET'] < 0) or (latest['COT_Idx'] <= (cot_thresh / 100.0))
-                    is_turning = latest['MM_NET'] > previous['MM_NET']
-                    if is_washed and is_turning:
-                        try:
-                            price_sym = guess_price_symbol(market, price_for_cot)
-                            px = yf_prices(price_sym, period="1y", interval="1d")
-                            wpx = weekly_from_daily(px)
-                            if len(wpx) < 10: continue
-                            wpx["SMA10W"] = wpx["Close"].rolling(10).mean()
-                            latest_price = wpx.iloc[-1]
-                            if latest_price['Close'] > latest_price['SMA10W']:
-                                results.append({
-                                    "Market": market, "Report_Date": latest['Date'].date(),
-                                    "MM_Net": f"{latest['MM_NET']:,.0f}", "COT_Index": f"{latest['COT_Idx']*100:.1f}%",
-                                    "Price_Symbol": price_sym, "Status": "✅ Triggered"
-                                })
-                        except Exception: continue
-                    progress_bar.progress((i + 1) / len(markets), text=f"Scanning {market}...")
-                progress_bar.progress(1.0, text="Scan complete.")
-                st.success(f"Found {len(results)} markets triggering the washout signal.")
-                if results:
-                    st.dataframe(pd.DataFrame(results), use_container_width=True)
+        cftc_df = load_cftc_data()
+        if cftc_df is not None:
+            if cftc_df.empty:
+                st.error("Failed to load CFTC data. Please try again from the first COT tab.")
+            else:
+                if st.button("Scan All Markets for Washouts", use_container_width=True, key="washout_scan"):
+                    results = []
+                    markets = cftc_df['Market'].unique()
+                    progress_bar = st.progress(0, text="Scanning markets...")
+                    for i, market in enumerate(markets):
+                        market_df = cftc_df[cftc_df['Market'] == market].copy()
+                        if len(market_df) < cot_window_weeks: continue
+                        market_df['MM_NET'] = market_df['MM_LONG'] - market_df['MM_SHORT']
+                        market_df['COT_Idx'] = cot_index(market_df['MM_NET'], cot_window_weeks)
+                        latest, previous = market_df.iloc[-1], market_df.iloc[-2]
+                        is_washed = (latest['MM_NET'] < 0) or (latest['COT_Idx'] <= (cot_thresh / 100.0))
+                        is_turning = latest['MM_NET'] > previous['MM_NET']
+                        if is_washed and is_turning:
+                            try:
+                                price_sym = guess_price_symbol(market, price_for_cot)
+                                px = yf_prices(price_sym, period="1y", interval="1d")
+                                wpx = weekly_from_daily(px)
+                                if len(wpx) < 10: continue
+                                wpx["SMA10W"] = wpx["Close"].rolling(10).mean()
+                                latest_price = wpx.iloc[-1]
+                                if latest_price['Close'] > latest_price['SMA10W']:
+                                    results.append({
+                                        "Market": market, "Report_Date": latest['Date'].date(),
+                                        "MM_Net": f"{latest['MM_NET']:,.0f}", "COT_Index": f"{latest['COT_Idx']*100:.1f}%",
+                                        "Price_Symbol": price_sym, "Status": "✅ Triggered"
+                                    })
+                            except Exception: continue
+                        progress_bar.progress((i + 1) / len(markets), text=f"Scanning {market}...")
+                    progress_bar.progress(1.0, text="Scan complete.")
+                    st.success(f"Found {len(results)} markets triggering the washout signal.")
+                    if results:
+                        st.dataframe(pd.DataFrame(results), use_container_width=True)
 
     # Tab 4 - Backtest Washouts
     with tab4:
         st.subheader("Backtest COT Washout Strategy")
-        try:
-            cftc_df = load_cftc_data()
-            if cftc_df is not None and not cftc_df.empty:
+        cftc_df = load_cftc_data()
+        if cftc_df is not None:
+            if cftc_df.empty:
+                st.error("Failed to load CFTC data. Please try again from the first COT tab.")
+            else:
                 bt_search = st.text_input("Search market", "GOLD", key="bt_search")
                 bt_markets = sorted(cftc_df["Market"].dropna().unique())
                 if bt_search: bt_markets = [m for m in bt_markets if bt_search.upper() in m.upper()]
@@ -522,8 +534,6 @@ if HAS_STREAMLIT:
                             st.dataframe(trades_df, use_container_width=True)
                         else:
                             st.warning("No trades were triggered for this market with the current settings.")
-        except Exception as e:
-            st.error(f"Backtest error: {e}")
 
     # Tab 5 — Prices
     with tab5:

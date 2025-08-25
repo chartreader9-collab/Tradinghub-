@@ -275,7 +275,6 @@ def fetch_cftc_disagg(user_agent: str) -> pd.DataFrame:
     base = "https://publicreporting.cftc.gov/resource/gr4m-cvuh.csv"
     params = {"$limit": 500000, "$order": "report_date_as_yyyy_mm_dd ASC"}
     
-    # **FIX**: Use a more comprehensive, browser-like header to avoid 403 Forbidden errors.
     headers = {
         "User-Agent": user_agent,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -284,20 +283,30 @@ def fetch_cftc_disagg(user_agent: str) -> pd.DataFrame:
         "Referer": "https://publicreporting.cftc.gov/data/",
         "Connection": "keep-alive",
     }
-    r = requests.get(base, params=params, headers=headers, timeout=30)
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text))
-    df.columns = [c.strip() for c in df.columns]
-    lc = {c.lower(): c for c in df.columns}
-    def need(name):
-        if name not in lc: raise RuntimeError(f"CFTC columns changed: missing {name}")
-        return lc[name]
-    date_c, mkt_c, long_c, short_c = need("report_date_as_yyyy_mm_dd"), need("market_and_exchange_names"), need("mgr_positions_long_all"), need("mgr_positions_short_all")
-    out = df[[date_c, mkt_c, long_c, short_c]].copy()
-    out.rename(columns={date_c: "Date", mkt_c: "Market", long_c: "MM_LONG", short_c: "MM_SHORT"}, inplace=True)
-    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
-    for col in ["MM_LONG", "MM_SHORT"]: out[col] = pd.to_numeric(out[col], errors="coerce")
-    return out.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+
+    # **FIX**: Add a retry mechanism to handle transient HTTP errors from the server.
+    for i in range(3): # Try up to 3 times
+        try:
+            r = requests.get(base, params=params, headers=headers, timeout=30)
+            r.raise_for_status()
+            df = pd.read_csv(io.StringIO(r.text))
+            df.columns = [c.strip() for c in df.columns]
+            lc = {c.lower(): c for c in df.columns}
+            def need(name):
+                if name not in lc: raise RuntimeError(f"CFTC columns changed: missing {name}")
+                return lc[name]
+            date_c, mkt_c, long_c, short_c = need("report_date_as_yyyy_mm_dd"), need("market_and_exchange_names"), need("mgr_positions_long_all"), need("mgr_positions_short_all")
+            out = df[[date_c, mkt_c, long_c, short_c]].copy()
+            out.rename(columns={date_c: "Date", mkt_c: "Market", long_c: "MM_LONG", short_c: "MM_SHORT"}, inplace=True)
+            out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+            for col in ["MM_LONG", "MM_SHORT"]: out[col] = pd.to_numeric(out[col], errors="coerce")
+            return out.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+        except requests.exceptions.HTTPError as e:
+            if i < 2: # If not the last attempt
+                time.sleep(3) # Wait for 3 seconds before retrying
+                continue
+            else:
+                raise e # Re-raise the exception if all retries fail
 
 
 def prepare_cot_auto(cftc_df: pd.DataFrame, market_filter: str, price_symbol: str, window: int, pctl: float) -> pd.DataFrame:
@@ -305,7 +314,7 @@ def prepare_cot_auto(cftc_df: pd.DataFrame, market_filter: str, price_symbol: st
     if sub.empty: raise ValueError("No rows found for that market filter.")
     sub = sub[["Date", "Market", "MM_LONG", "MM_SHORT"]].sort_values("Date").reset_index(drop=True)
     sub["MM_NET"] = sub["MM_LONG"] - sub["MM_SHORT"]
-    px = yf_prices(price_symbol, period="10y", interval="1d")
+    px = yf_prices(price_symbol, period="20y", interval="1d") # Fetch more data for backtesting
     wpx = weekly_from_daily(px)
     wpx["SMA10W"] = wpx["Close"].rolling(10).mean()
     merged = pd.merge_asof(wpx.sort_values("Date"), sub.sort_values("Date"), on="Date", direction="backward")
@@ -314,7 +323,52 @@ def prepare_cot_auto(cftc_df: pd.DataFrame, market_filter: str, price_symbol: st
     merged["TurnUp"]  = merged["MM_NET"].diff() > 0
     merged["PriceUp"] = merged["Close"] > merged["SMA10W"]
     merged["Trigger"] = merged["Washed"] & merged["TurnUp"] & merged["PriceUp"]
-    return merged
+    return merged.dropna()
+
+# ───────── Backtesting Engine ─────────
+
+def run_washout_backtest(merged_df: pd.DataFrame, hold_weeks: int) -> tuple[pd.DataFrame, dict]:
+    """Runs a simple backtest on the washout strategy signals."""
+    trades = []
+    signals = merged_df[merged_df['Trigger']].copy()
+
+    if signals.empty:
+        return pd.DataFrame(), {}
+
+    for idx, signal_row in signals.iterrows():
+        entry_date = signal_row['Date']
+        entry_price = signal_row['Close']
+        try:
+            signal_iloc = merged_df.index.get_loc(idx)
+        except KeyError:
+            continue
+        exit_iloc = signal_iloc + hold_weeks
+        if exit_iloc >= len(merged_df):
+            continue
+        exit_row = merged_df.iloc[exit_iloc]
+        exit_date = exit_row['Date']
+        exit_price = exit_row['Close']
+        pct_return = (exit_price - entry_price) / entry_price
+        trades.append({
+            "EntryDate": entry_date.date(), "EntryPrice": entry_price,
+            "ExitDate": exit_date.date(), "ExitPrice": exit_price,
+            "HoldWeeks": hold_weeks, "ReturnPct": pct_return,
+        })
+
+    if not trades:
+        return pd.DataFrame(), {}
+
+    trades_df = pd.DataFrame(trades)
+    trades_df['CumulativeReturn'] = (1 + trades_df['ReturnPct']).cumprod()
+    summary = {
+        "Total Trades": len(trades_df),
+        "Win Rate %": (trades_df['ReturnPct'] > 0).mean() * 100,
+        "Avg Return %": trades_df['ReturnPct'].mean() * 100,
+        "Avg Win %": trades_df[trades_df['ReturnPct'] > 0]['ReturnPct'].mean() * 100 if not trades_df[trades_df['ReturnPct'] > 0].empty else 0,
+        "Avg Loss %": trades_df[trades_df['ReturnPct'] < 0]['ReturnPct'].mean() * 100 if not trades_df[trades_df['ReturnPct'] < 0].empty else 0,
+        "Total Return %": (trades_df['CumulativeReturn'].iloc[-1] - 1) * 100
+    }
+    return trades_df, summary
 
 # ───────── S&P500 list (used in Streamlit tab) ─────────
 
@@ -331,13 +385,11 @@ def batch(lst, n):
 if HAS_STREAMLIT:
     st.title("📊 Trading Hub — Real Data")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🏦 Insider (watchlist)",
-        "📝 COT (auto from CFTC)",
-        "🌊 COT Washout Strategy",
-        "📈 Prices",
-        "🌐 Market Scan (S&P 500)",
-    ])
+    tab_list = [
+        "🏦 Insider (watchlist)", "📝 COT (auto from CFTC)", "🌊 COT Washout Strategy",
+        "📈 Backtest Washouts", "💹 Prices", "🌐 Market Scan (S&P 500)"
+    ]
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(tab_list)
 
     # Tab 1 — Insider watchlist
     with tab1:
@@ -355,24 +407,33 @@ if HAS_STREAMLIT:
                     top = df.iloc[0]
                     st.caption(f"Top: {top['Ticker']} — ${top['BuyUSD_lookback']:,.0f} in {lookback_days}d; buys: {int(top['Buys'])}")
 
+    # Common COT data loading
+    cftc_df = None
+    if 'cftc_df' not in st.session_state:
+        st.session_state.cftc_df = None
+
+    def load_cftc_data():
+        if st.session_state.cftc_df is None:
+            if not ua or "@" not in ua:
+                st.error("Enter a valid User-Agent in the sidebar to fetch CFTC data.")
+                return None
+            with st.spinner("Fetching CFTC Public Reporting dataset…"):
+                st.session_state.cftc_df = fetch_cftc_disagg(ua)
+        return st.session_state.cftc_df
+
     # Tab 2 — COT auto (Socrata)
     with tab2:
         st.subheader("Disaggregated Futures+Options Combined (CFTC Public Reporting)")
         try:
-            with st.spinner("Fetching CFTC Public Reporting dataset…"):
-                if not ua or "@" not in ua:
-                    st.error("Enter a valid User-Agent in the sidebar to fetch CFTC data.")
-                    cftc_df = pd.DataFrame()
-                else:
-                    cftc_df = fetch_cftc_disagg(ua)
-            if not cftc_df.empty:
-                search = st.text_input("Search market", "GOLD")
+            cftc_df = load_cftc_data()
+            if cftc_df is not None and not cftc_df.empty:
+                search = st.text_input("Search market", "GOLD", key="cot_search")
                 markets = sorted(cftc_df["Market"].dropna().unique())
                 if search: markets = [m for m in markets if search.upper() in m.upper()]
                 if not markets: st.warning("No markets match your search.")
                 else:
-                    mkt_filter = st.selectbox("Choose/Filter market (substring)", markets, index=0)
-                    price_hint = st.text_input("Override price symbol (optional)", value=guess_price_symbol(mkt_filter, price_for_cot))
+                    mkt_filter = st.selectbox("Choose/Filter market", markets, index=0, key="cot_market")
+                    price_hint = st.text_input("Override price symbol", value=guess_price_symbol(mkt_filter, price_for_cot), key="cot_price")
                     if st.button("Run COT scan", use_container_width=True):
                         merged = prepare_cot_auto(cftc_df, mkt_filter, price_hint, cot_window_weeks, cot_thresh)
                         st.dataframe(merged.tail(20), use_container_width=True)
@@ -390,33 +451,22 @@ if HAS_STREAMLIT:
     # Tab 3 - COT Washout Strategy
     with tab3:
         st.subheader("COT Washout Strategy Scanner")
-        st.markdown("This tool scans all markets to find those where Managed Money sentiment is extremely bearish (washed out) but the price has started to show strength. This can be a powerful contrarian buy signal.")
+        st.markdown("Scans all markets for extreme bearish sentiment combined with early signs of price strength.")
         if st.button("Scan All Markets for Washouts", use_container_width=True, key="washout_scan"):
-            if not ua or "@" not in ua: st.error("Enter a valid User-Agent in the sidebar.")
-            else:
-                with st.spinner("Fetching latest CFTC data for all markets..."):
-                    all_cot = fetch_cftc_disagg(ua)
-                
+            cftc_df = load_cftc_data()
+            if cftc_df is not None and not cftc_df.empty:
                 results = []
-                markets = all_cot['Market'].unique()
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-
+                markets = cftc_df['Market'].unique()
+                progress_bar = st.progress(0, text="Scanning markets...")
                 for i, market in enumerate(markets):
-                    market_df = all_cot[all_cot['Market'] == market].copy()
+                    market_df = cftc_df[cftc_df['Market'] == market].copy()
                     if len(market_df) < cot_window_weeks: continue
-                    
                     market_df['MM_NET'] = market_df['MM_LONG'] - market_df['MM_SHORT']
                     market_df['COT_Idx'] = cot_index(market_df['MM_NET'], cot_window_weeks)
-                    
-                    latest = market_df.iloc[-1]
-                    previous = market_df.iloc[-2]
-
-                    is_washed_out = (latest['MM_NET'] < 0) or (latest['COT_Idx'] <= (cot_thresh / 100.0))
-                    is_turning_up = latest['MM_NET'] > previous['MM_NET']
-
-                    if is_washed_out and is_turning_up:
-                        status_text.text(f"Found potential washout in {market}. Checking price...")
+                    latest, previous = market_df.iloc[-1], market_df.iloc[-2]
+                    is_washed = (latest['MM_NET'] < 0) or (latest['COT_Idx'] <= (cot_thresh / 100.0))
+                    is_turning = latest['MM_NET'] > previous['MM_NET']
+                    if is_washed and is_turning:
                         try:
                             price_sym = guess_price_symbol(market, price_for_cot)
                             px = yf_prices(price_sym, period="1y", interval="1d")
@@ -424,41 +474,64 @@ if HAS_STREAMLIT:
                             if len(wpx) < 10: continue
                             wpx["SMA10W"] = wpx["Close"].rolling(10).mean()
                             latest_price = wpx.iloc[-1]
-                            
                             if latest_price['Close'] > latest_price['SMA10W']:
                                 results.append({
-                                    "Market": market,
-                                    "Report_Date": latest['Date'].date(),
-                                    "MM_Net": f"{latest['MM_NET']:,.0f}",
-                                    "COT_Index": f"{latest['COT_Idx']*100:.1f}%",
-                                    "Price_Symbol": price_sym,
-                                    "Status": "✅ Triggered"
+                                    "Market": market, "Report_Date": latest['Date'].date(),
+                                    "MM_Net": f"{latest['MM_NET']:,.0f}", "COT_Index": f"{latest['COT_Idx']*100:.1f}%",
+                                    "Price_Symbol": price_sym, "Status": "✅ Triggered"
                                 })
-                        except Exception:
-                            continue # Skip if price check fails
-                    
-                    progress_bar.progress((i + 1) / len(markets))
-                
-                status_text.text("Scan complete.")
+                        except Exception: continue
+                    progress_bar.progress((i + 1) / len(markets), text=f"Scanning {market}...")
+                progress_bar.progress(1.0, text="Scan complete.")
                 st.success(f"Found {len(results)} markets triggering the washout signal.")
                 if results:
                     st.dataframe(pd.DataFrame(results), use_container_width=True)
 
-    # Tab 4 — Prices
+    # Tab 4 - Backtest Washouts
     with tab4:
+        st.subheader("Backtest COT Washout Strategy")
+        try:
+            cftc_df = load_cftc_data()
+            if cftc_df is not None and not cftc_df.empty:
+                bt_search = st.text_input("Search market", "GOLD", key="bt_search")
+                bt_markets = sorted(cftc_df["Market"].dropna().unique())
+                if bt_search: bt_markets = [m for m in bt_markets if bt_search.upper() in m.upper()]
+                if not bt_markets: st.warning("No markets match your search.")
+                else:
+                    bt_market = st.selectbox("Choose market to backtest", bt_markets, index=0, key="bt_market")
+                    bt_price = st.text_input("Price symbol for backtest", value=guess_price_symbol(bt_market, price_for_cot), key="bt_price")
+                    hold_weeks = st.slider("Hold period (weeks)", 1, 52, 12, key="bt_hold")
+                    if st.button("Run Backtest", use_container_width=True):
+                        with st.spinner("Preparing data and running backtest..."):
+                            merged_data = prepare_cot_auto(cftc_df, bt_market, bt_price, cot_window_weeks, cot_thresh)
+                            trades_df, summary = run_washout_backtest(merged_data, hold_weeks)
+                        st.success("Backtest complete.")
+                        if not trades_df.empty:
+                            st.subheader("Performance Summary")
+                            cols = st.columns(4)
+                            cols[0].metric("Total Trades", summary['Total Trades'])
+                            cols[1].metric("Win Rate", f"{summary['Win Rate %']:.2f}%")
+                            cols[2].metric("Avg Return", f"{summary['Avg Return %']:.2f}%")
+                            cols[3].metric("Total Return", f"{summary['Total Return %']:.2f}%")
+                            
+                            st.subheader("Equity Curve")
+                            equity_curve = trades_df[['EntryDate', 'CumulativeReturn']].set_index('EntryDate')
+                            st.line_chart(equity_curve)
+
+                            st.subheader("All Trades")
+                            st.dataframe(trades_df, use_container_width=True)
+                        else:
+                            st.warning("No trades were triggered for this market with the current settings.")
+        except Exception as e:
+            st.error(f"Backtest error: {e}")
+
+    # Tab 5 — Prices
+    with tab5:
         st.subheader("Quick price chart with SMA")
-        px_ticker = st.text_input("Ticker (e.g., AAPL, GC=F, CL=F)", value="AAPL", key="px_ticker")
-        period = st.selectbox("Period", ["6mo","1y","2y","5y","10y"], index=2)
-        if st.button("Load prices", key="load_px"):
+        px_ticker = st.text_input("Ticker", value="AAPL", key="px_ticker")
+        period = st.selectbox("Period", ["6mo","1y","2y","5y","10y", "max"], index=2, key="px_period")
+        if st.button("Load prices", key="load_px", use_container_width=True):
             dfp = yf_prices(px_ticker, period=period, interval="1d")
-            if "Date" not in dfp.columns:
-                dfp = dfp.reset_index()
-                for cand in ("index", "Datetime", "datetime", "date"):
-                    if cand in dfp.columns:
-                        dfp.rename(columns={cand: "Date"}, inplace=True)
-                        break
-            if "Close" not in dfp.columns and "close" in dfp.columns:
-                dfp.rename(columns={"close": "Close"}, inplace=True)
             if "Date" in dfp.columns and "Close" in dfp.columns:
                 dfp["SMA50"] = dfp["Close"].rolling(50).mean()
                 dfp["SMA200"] = dfp["Close"].rolling(200).mean()
@@ -467,15 +540,15 @@ if HAS_STREAMLIT:
             else:
                 st.error("Price data missing Date/Close columns.")
 
-    # Tab 5 — S&P 500 Market Scan
-    with tab5:
-        st.subheader("S&P 500 Insider Buy Leaderboard (batch‑scanned)")
-        st.caption("Loads S&P 500 from Wikipedia, scans in batches to respect SEC limits.")
+    # Tab 6 — S&P 500 Market Scan
+    with tab6:
+        st.subheader("S&P 500 Insider Buy Leaderboard")
+        st.caption("Scans S&P 500 companies in batches to respect SEC rate limits.")
         colA, colB = st.columns(2)
         batch_size = colA.slider("Batch size", 20, 200, 60, step=10)
         max_batches = colB.slider("Batches to run now", 1, 20, 3, step=1)
         if st.button("Run S&P 500 scan", use_container_width=True):
-            if not ua or "@" not in ua: st.error("Enter a valid User‑Agent with email in the sidebar.")
+            if not ua or "@" not in ua: st.error("Enter a valid User‑Agent in the sidebar.")
             else:
                 with st.spinner("Loading S&P 500 list…"): sp = load_sp500_tickers()
                 results, batches = [], 0
